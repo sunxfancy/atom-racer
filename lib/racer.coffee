@@ -27,6 +27,11 @@ module.exports =
       default: 'New'
       enum: ['Right', 'New']
       order: 4
+    tempFilePath:
+      title: 'Path for temp file created'
+      type: 'string'
+      default: '.'
+      order: 5
   # members
   racerProvider: null
   subscriptions: null

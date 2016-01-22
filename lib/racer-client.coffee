@@ -9,9 +9,11 @@ class RacerClient
   racer_bin: null
   rust_src: null
   project_path: null
+  temp_path: null
   candidates: null
   last_stderr: null
-  last_process: null
+  # last_process: null
+  racer: null
 
   check_generator = (racer_action) ->
     (editor, row, col, cb) ->
@@ -20,7 +22,10 @@ class RacerClient
         cb null
         return
 
-      temp_folder_path = path.dirname(editor.getPath())
+      if !@project_path?
+        @project_path = path.dirname(editor.getPath())
+
+      temp_folder_path = @temp_path
       original_file_name = path.basename(editor.getPath())
       # temp_folder_path will be '.' for unsaved files
       if temp_folder_path == "."
@@ -40,32 +45,69 @@ class RacerClient
 
           text = editor.getText()
           fs.writeFileSync tempFilePath, text
-          fs.close(info.fd);
-          options =
-            command: @racer_bin
-            args: [racer_action, row + 1, col, tempFilePath]
-            stdout: (output) =>
-              return unless this_process == @latest_process
+          fs.close(info.fd)
+
+        #   begin
+          if !@racer?
+            spawn = require('child_process').spawn
+            @racer = spawn(@racer_bin, ['daemon'])
+
+            @bufferStream @racer.stdout, (output) =>
+              if output == 'END'
+                @candidates = _.uniq(_.compact(_.flatten(@candidates)), (e) => e.word + e.file + e.type )
+                cb @candidates if @candidates?
+                console.log(@candidates)
+                temp.cleanup()
+                return
               parsed = @parse_single(output)
               @candidates.push(parsed) if parsed
               return
-            stderr: (output) =>
-                return unless this_process == @latest_process
-                @last_stderr = output
-                return
-            exit: (code) =>
-              return unless this_process == @latest_process
-              @candidates = _.uniq(_.compact(_.flatten(@candidates)), (e) => e.word + e.file + e.type )
-              cb @candidates
-              temp.cleanup()
+            @bufferStream @racer.stderr, (output) =>
+              console.log(output)
+              @last_stderr = output
+              return
+            @racer.on 'exit', (code) =>
               if code == 3221225781
                 atom.notifications.addWarning "racer could not find a required DLL; copy racer to your Rust bin directory"
               else if code != 0
                 atom.notifications.addWarning "racer returned a non-zero exit code: #{code}\n#{@last_stderr}"
               return
-
           @candidates = []
-          @latest_process = this_process = new BufferedProcess(options)
+          args = @makeargs([racer_action, row + 1, col, tempFilePath])
+          @racer.stdin.write( args )
+          return
+
+        #   source
+
+        #   options =
+        #     command: @racer_bin
+        #     args: [racer_action, row + 1, col, tempFilePath]
+        #     stdout: (output) =>
+        #       console.log(output)
+        #     #   return unless this_process == @latest_process
+        #       parsed = @parse_single(output)
+        #       console.log('parsed', parsed)
+        #       @candidates.push(parsed) if parsed
+        #       return
+        #     stderr: (output) =>
+        #         # return unless this_process == @latest_process
+        #         @last_stderr = output
+        #         console.log(output)
+        #         return
+        #     exit: (code) =>
+        #     #   return unless this_process == @latest_process
+        #       @candidates = _.uniq(_.compact(_.flatten(@candidates)), (e) => e.word + e.file + e.type )
+        #       console.log(@candidates)
+        #       cb @candidates
+        #       temp.cleanup()
+        #       if code == 3221225781
+        #         atom.notifications.addWarning "racer could not find a required DLL; copy racer to your Rust bin directory"
+        #       else if code != 0
+        #         atom.notifications.addWarning "racer returned a non-zero exit code: #{code}\n#{@last_stderr}"
+        #       return
+          #
+        #   @candidates = []
+        #   @latest_process = this_process = new BufferedProcess(options)
           return
       return
 
@@ -75,7 +117,6 @@ class RacerClient
 
   process_env_vars: ->
     config_is_valid = true
-
     if !@racer_bin?
       conf_bin = atom.config.get("racer.racerBinPath")
       if conf_bin
@@ -83,17 +124,22 @@ class RacerClient
           stats = fs.statSync(conf_bin);
           if stats?.isFile()
             @racer_bin = conf_bin
+
     if !@racer_bin?
       config_is_valid = false
       atom.notifications.addFatalError "racer.racerBinPath is not set in your config."
+
+    if !@temp_path?
+      @temp_path = atom.config.get("racer.tempFilePath")
 
     if !@rust_src?
       conf_src = atom.config.get("racer.rustSrcPath")
       if conf_src
         try
-          stats = fs.statSync(conf_src);
+          stats = fs.statSync(conf_src)
           if stats?.isDirectory()
             @rust_src = conf_src
+
     if !@rust_src?
       config_is_valid = false
       atom.notifications.addFatalError "racer.rustSrcPath is not set in your config."
@@ -105,7 +151,7 @@ class RacerClient
 
   parse_single: (line) ->
     matches = []
-    rcrgex = /MATCH (\w*)\,(\d*)\,(\d*)\,([^\,]*)\,(\w*)\,(.*)\n/mg
+    rcrgex = /MATCH (\w*)\,(\d*)\,(\d*)\,([^\,]*)\,(\w*)\,(.*)/mg
     while match = rcrgex.exec(line)
       if match?.length > 4
         candidate = {word: match[1], line: parseInt(match[2], 10), column: parseInt(match[3], 10), filePath: match[4], file: "this", type: match[5], context: match[6]}
@@ -116,3 +162,30 @@ class RacerClient
           candidate.file = file_name
         matches.push(candidate)
     return matches
+
+  bufferStream: (stream, onLines, onDone) ->
+    stream.setEncoding('utf8')
+    buffered = ''
+
+    stream.on 'data', (data) =>
+      buffered += data
+      lastNewlineIndex = buffered.lastIndexOf('\n')
+      if lastNewlineIndex isnt -1
+        for line in buffered.substring(0, lastNewlineIndex).split('\n')
+          onLines(line)
+        buffered = buffered.substring(lastNewlineIndex + 1)
+      return
+
+    stream.on 'close', =>
+      onLines(buffered) if buffered.length > 0
+      onDone()
+      return
+    return
+
+  makeargs: (args) ->
+    line = ''
+    for item in args
+      line += item
+      line += ' '
+    line += '\n'
+    return line
